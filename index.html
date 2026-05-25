@@ -351,6 +351,12 @@
         <li>Copiez chaque lien généré dans le champ correspondant ci-dessus</li>
         <li>Gardez l'ordre des colonnes identique à l'Excel d'origine</li>
       </ol>
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);">
+        <b>Fonctionne en double-clic :</b> ce dashboard sait récupérer les
+        données même ouvert localement. Si la connexion directe est bloquée,
+        il passe automatiquement par un relais. Le premier chargement peut
+        prendre quelques secondes — c'est normal.
+      </div>
     </div>
 
     <div class="btn-row">
@@ -404,10 +410,49 @@ const DEMO = {
 const cfg = (()=>{ try{return JSON.parse(localStorage.getItem('wt_cfg'))||{};}catch(e){return {};} })();
 
 /* ============ UTILITAIRES ============ */
+const MOIS_FR={
+  janv:0,janvier:0,'janv.':0,
+  fevr:1,'févr':1,fevrier:1,'février':1,'févr.':1,'fevr.':1,fev:1,'fév':1,
+  mars:2,
+  avr:3,avril:3,'avr.':3,
+  mai:4,
+  juin:5,
+  juil:6,juillet:6,'juil.':6,
+  aout:7,'août':7,
+  sept:8,septembre:8,'sept.':8,
+  oct:9,octobre:9,'oct.':9,
+  nov:10,novembre:10,'nov.':10,
+  dec:11,'déc':11,decembre:11,'décembre':11,'déc.':11,'dec.':11
+};
 function excelToDate(serial){
   if(serial==null||serial==="") return null;
+  // 1) nombre série Excel
   const n=Number(serial);
   if(!isNaN(n) && n>20000 && n<90000) return new Date(Date.UTC(1899,11,30)+n*86400000);
+  const s=String(serial).trim().toLowerCase();
+  // 2) format français court "26-mai", "1 juin", "5-juin"
+  let m=s.match(/^(\d{1,2})[\s\-\/]+([a-zàâäéèêëîïôöùûü\.]+)$/);
+  if(m){
+    const mois=MOIS_FR[m[2]];
+    if(mois!==undefined){
+      const jour=parseInt(m[1],10);
+      let an=new Date().getFullYear();
+      // si la date semble passée de plus de 6 mois, on prend l'année suivante
+      let dt=new Date(Date.UTC(an,mois,jour));
+      const diff=(dt-Date.now())/86400000;
+      if(diff<-183) dt=new Date(Date.UTC(an+1,mois,jour));
+      return dt;
+    }
+  }
+  // 3) format jj/mm/aaaa ou jj/mm
+  m=s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
+  if(m){
+    const jour=+m[1], mois=+m[2]-1;
+    let an=m[3]?+m[3]:new Date().getFullYear();
+    if(an<100) an+=2000;
+    return new Date(Date.UTC(an,mois,jour));
+  }
+  // 4) tentative native
   const d=new Date(serial);
   return isNaN(d)?null:d;
 }
@@ -423,6 +468,16 @@ function daysUntil(serial){
 }
 function jClass(j){ if(j===null)return'j-ok'; if(j<0)return'j-late'; if(j<=2)return'j-soon'; return'j-ok'; }
 function jLabel(j){ if(j===null)return'—'; if(j===0)return'J'; return j>0?'J-'+j:'J+'+Math.abs(j); }
+/* boxing : accepte 0.25 / "25%" / "25" / "0,25" -> fraction 0..1 */
+function parseBoxing(v){
+  if(v==null||v==="") return 0;
+  let s=String(v).trim().replace(',','.').replace('%','').trim();
+  let n=parseFloat(s);
+  if(isNaN(n)) return 0;
+  if(String(v).indexOf('%')>-1) return n/100;   // "25%" -> 0.25
+  if(n>1) return n/100;                          // "25"  -> 0.25
+  return n;                                      // 0.25  -> 0.25
+}
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
 /* ============ RENDU LIGNES ============ */
@@ -446,7 +501,7 @@ function rowOk(r){
 }
 function rowExport(r){
   const j=daysUntil(r.export);
-  const pct=Math.round((Number(r.boxing)||0)*100);
+  const pct=Math.round(parseBoxing(r.boxing)*100);
   const col=pct>=80?'var(--green)':pct>=50?'var(--orange)':'var(--red)';
   return `<div class="row row-export">
     <span class="client">${esc(r.client)}</span>
@@ -475,7 +530,7 @@ function fillList(id,items,rowFn){
 
 /* ============ KPIs ============ */
 function renderKpis(d){
-  const bx=d.export.map(r=>Number(r.boxing)||0);
+  const bx=d.export.map(r=>parseBoxing(r.boxing));
   const avg=bx.length?Math.round(bx.reduce((a,b)=>a+b,0)/bx.length*100):0;
   const late=d.risk.filter(r=>{const j=daysUntil(r.echeance);return j!==null&&j<0;}).length;
   const urgent=d.risk.filter(r=>{const j=daysUntil(r.echeance);return j!==null&&j>=0&&j<=2;}).length;
@@ -546,10 +601,29 @@ function parseCSV(text){
   if(cur!==''||row.length){row.push(cur);rows.push(row);}
   return rows.filter(r=>r.some(c=>c.trim()!==''));
 }
+/* Stratégies de récupération : connexion directe puis relais publics.
+   Permet le fonctionnement même en ouvrant le fichier en double-clic (file://). */
+const PROXIES=[
+  u=>u,                                                   // 1. direct
+  u=>'https://corsproxy.io/?url='+encodeURIComponent(u),   // 2. relais corsproxy
+  u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u), // 3. relais allorigins
+  u=>'https://thingproxy.freeboard.io/fetch/'+u            // 4. relais thingproxy
+];
 async function fetchCSV(url){
-  const res=await fetch(url,{cache:'no-store'});
-  if(!res.ok) throw new Error('HTTP '+res.status);
-  return parseCSV(await res.text());
+  let lastErr;
+  for(let i=0;i<PROXIES.length;i++){
+    try{
+      const target=PROXIES[i](url)+(url.indexOf('?')>-1?'&':'?')+'_t='+Date.now();
+      const res=await fetch(target,{cache:'no-store'});
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const txt=await res.text();
+      if(!txt || txt.trim()===''){ throw new Error('réponse vide'); }
+      // une page Google d'erreur renvoie du HTML, pas du CSV
+      if(/^\s*<(!doctype|html)/i.test(txt)) throw new Error('réponse non CSV');
+      return parseCSV(txt);
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr||new Error('échec');
 }
 function mapRows(rows,keys){
   return rows.slice(1).map(r=>{
